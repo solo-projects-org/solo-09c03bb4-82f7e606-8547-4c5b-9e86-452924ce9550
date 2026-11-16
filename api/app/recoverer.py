@@ -88,6 +88,12 @@ def run_job(job_id: int) -> None:
     try:
         if not cp:
             raise RuntimeError(f"核对点 {job['checkpoint_name']} 不存在")
+        # 身份衔接：任务登记的 id/LSN/源库标记名必须与核对点当前记录一致
+        err = state.checkpoint_identity_error(job, cp)
+        if err:
+            raise RuntimeError(err)
+        if not cp["restore_lsn"]:
+            raise RuntimeError(f"核对点 {cp['name']} 没有已确认的 LSN")
 
         # 1) 等待 WAL 归档齐备（核对点落盘 + 备份起点到核对点的段全部在归档中）
         state.update_job(job_id, status="waiting_wal", detail="等待核对点 WAL 归档")
@@ -130,7 +136,10 @@ def run_job(job_id: int) -> None:
         os.makedirs(config.RECOVERY_DIR, exist_ok=True)
         shutil.copytree(backup["path"], ddir, symlinks=True)
         os.chmod(ddir, 0o700)
-        _write_recovery_conf(ddir, cp["name"])
+        # 停点目标同时锚定「本次登记的内部唯一名」与「登记 LSN」：
+        # 新登记内部名在 WAL 中唯一，旧版（按可见名登记）记录只用 LSN，
+        # 避免历史同名标记把恢复拉回前一个点。
+        _write_recovery_conf(ddir, cp)
         _check_cancel(job_id)
 
         # 4) 启动实例，WAL 重放到核对点自动暂停
@@ -180,13 +189,20 @@ def _missing_segments(backup: dict, cp: dict, seg_size: int) -> list[str]:
     return missing
 
 
-def _write_recovery_conf(ddir: str, cp_name: str) -> None:
+def _write_recovery_conf(ddir: str, cp: dict) -> None:
     # recovery.signal 触发归档恢复模式；配置追加到 auto.conf 末尾（后写优先）
+    #
+    # 停点必须用名称而不是 recovery_target_lsn：LSN 目标落在 WAL 记录边界时
+    # PostgreSQL 会多应用一条紧随的记录（若恰好是提交记录，会把跨点事务带进来）。
+    # 按名称停在 RESTORE_POINT 记录上则是精确的（停点即该记录结束位点）。
+    # 新登记使用每次唯一的内部名，历史同名标记不会造成歧义；旧库迁移来的记录
+    # 仍用可见名，停点若与登记 LSN 不符会在校验阶段如实 failed。
+    target_name = cp["source_name"]
     open(os.path.join(ddir, "recovery.signal"), "w").close()
     conf = f"""
-# ---- pitr-api 追加：PITR 恢复到命名核对点，提升后只读 ----
+# ---- pitr-api 追加：PITR 恢复到登记的内部唯一标记，提升后只读 ----
 restore_command = 'cp {config.ARCHIVE_DIR}/%f %p'
-recovery_target_name = '{cp_name}'
+recovery_target_name = '{target_name}'
 recovery_target_action = 'pause'
 recovery_target_timeline = 'latest'
 archive_mode = off
@@ -215,7 +231,15 @@ def _wait_replay_paused(job_id: int, cp: dict, ddir: str) -> None:
                 ).fetchone()
             if not in_rec:
                 raise RuntimeError("实例未处于恢复状态，恢复目标配置异常")
-            if paused and last and lsn_to_int(last) >= target:
+            if paused and last:
+                # 内部标记名在 WAL 中唯一：pause 位点必须精确等于登记的 LSN，
+                # 多字节或少字节都说明停点不是本次登记，不能报就绪。
+                # 旧库迁移的可见名若在 WAL 中有同名历史标记，会停在前一个标记，
+                # 这里立即失败而不是空等到超时。
+                if lsn_to_int(last) != target:
+                    raise RuntimeError(
+                        f"恢复停点 {last} 与登记 LSN {cp['restore_lsn']} 不一致，"
+                        f"拒绝把错位恢复结果报为就绪")
                 return
         except psycopg.Error:
             pass  # 还没到可连接阶段，继续等
@@ -234,9 +258,16 @@ def _verify_and_promote(cp: dict, ddir: str) -> int:
         ).fetchone()
         if not in_rec:
             raise RuntimeError("校验失败：实例不在恢复状态")
-        if not last or lsn_to_int(last) < target:
+        if not last or lsn_to_int(last) != target:
             raise RuntimeError(
-                f"校验失败：重放位点 {last or '-'} 未到达核对点 {cp['restore_lsn']}"
+                f"校验失败：重放位点 {last or '-'} 与登记核对点 LSN"
+                f" {cp['restore_lsn']} 不一致"
+            )
+        used_name = con.execute("SHOW recovery_target_name").fetchone()[0]
+        if used_name != cp["source_name"]:
+            raise RuntimeError(
+                f"校验失败：恢复目标标记 {used_name!r} 与登记的"
+                f" {cp['source_name']!r} 不一致"
             )
         con.execute("SELECT pg_wal_replay_resume()")
     # 等待 promote 完成

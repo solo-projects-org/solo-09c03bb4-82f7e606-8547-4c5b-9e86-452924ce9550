@@ -4,6 +4,7 @@
 把核对点恢复到独立只读实例并开放样品查询。Swagger 见 /docs。
 """
 import os
+import secrets
 import threading
 from contextlib import asynccontextmanager
 
@@ -20,18 +21,22 @@ DESCRIPTION = """
 
 * 基准备份：`pg_basebackup` 在线物理拷贝，源库全程可写；
 * 核对点：`pg_create_restore_point` 命名恢复点 + WAL 归档齐备检查；
-* 恢复：基准备份 + 归档 WAL 重放到核对点（pause → 校验位点 → promote），
-  产出**独立只读**实例；跨点后才提交的事务不会出现；
+  同名登记原子占位，并发最多确认一个，已确认名称继续拒绝重复登记；
+  每次登记使用内部唯一标记名，中断后同名重试得到全新 LSN，绝不复用旧标记；
+* 恢复：基准备份 + 归档 WAL 重放到**登记时那个内部标记**（pause → 校验停点
+  与登记 LSN 精确一致 → promote），产出**独立只读**实例；跨点后才提交的事务
+  不会出现；停点不一致或未完成一律 `failed`，绝不报就绪；
 * 查询：只打恢复实例，绝不用当前源库冒充恢复结果；
-* 一次只恢复一项；失败或重启后可按原核对点重试。
+* 一次只恢复一项；失败或重启后可按原核对点重试（任务绑定登记时的身份快照）。
 """
 
 
 # ------------------------------------------------------------------ 模型
 
 class CheckpointIn(BaseModel):
-    name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
-                      examples=["cp1"], description="核对点名称（唯一）")
+    # PostgreSQL 的恢复点名称上限为 63 字节，校验不通过会在源库报错
+    name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$",
+                      examples=["cp1"], description="核对点名称（唯一，≤63 字符）")
 
 
 class RecoveryIn(BaseModel):
@@ -57,7 +62,8 @@ def _refresher_loop() -> None:
 def refresh_checkpoints() -> None:
     """waiting_wal → ready（WAL 已归档）；新基准备份使更早核对点 expired。"""
     for cp in state.all_rows("SELECT * FROM checkpoints WHERE status='waiting_wal'"):
-        if os.path.exists(os.path.join(config.ARCHIVE_DIR, cp["wal_file"])):
+        if cp["wal_file"] and os.path.exists(
+                os.path.join(config.ARCHIVE_DIR, cp["wal_file"])):
             state.execute(
                 "UPDATE checkpoints SET status='ready', ready_at=? WHERE id=?",
                 (state.now(), cp["id"]),
@@ -67,7 +73,8 @@ def refresh_checkpoints() -> None:
         for cp in state.all_rows(
             "SELECT * FROM checkpoints WHERE status IN ('waiting_wal','ready')"
         ):
-            if lsn_to_int(cp["restore_lsn"]) < lsn_to_int(backup["start_lsn"]):
+            if (cp["restore_lsn"]
+                    and lsn_to_int(cp["restore_lsn"]) < lsn_to_int(backup["start_lsn"])):
                 state.execute(
                     "UPDATE checkpoints SET status='expired' WHERE id=?", (cp["id"],)
                 )
@@ -75,6 +82,7 @@ def refresh_checkpoints() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    _stop.clear()  # 同一进程内可重复启动（测试/热重载），复位关停信号
     for d in (config.BACKUP_DIR, config.RECOVERY_DIR,
               os.path.dirname(config.STATE_DB) or "."):
         os.makedirs(d, exist_ok=True)
@@ -107,6 +115,16 @@ app = FastAPI(title="水质数仓 PITR 恢复服务", version="1.0.0",
 
 # ------------------------------------------------------------------ 工具
 
+_INTERNAL_CP_FIELDS = ("source_name", "boot_id")
+
+
+def _public_cp(cp: dict | None) -> dict | None:
+    """对外隐藏内部标记名与进程标识，保持 API 形状稳定。"""
+    if cp is None:
+        return None
+    return {k: v for k, v in cp.items() if k not in _INTERNAL_CP_FIELDS}
+
+
 def _job_or_404(job_id: int) -> dict:
     job = state.one_row("SELECT * FROM jobs WHERE id=?", (job_id,))
     if not job:
@@ -118,6 +136,32 @@ def _cp_or_404(name: str) -> dict:
     cp = state.one_row("SELECT * FROM checkpoints WHERE name=?", (name,))
     if not cp:
         raise HTTPException(404, f"核对点 {name} 不存在")
+    return cp
+
+
+def _confirmed_cp_or_409(name: str) -> dict:
+    """恢复只能使用已确认的核对点；pending/aborted 从未绑定可信 LSN。"""
+    cp = _cp_or_404(name)
+    if cp["status"] == "pending":
+        raise HTTPException(409, f"核对点 {name} 正在登记中（pending），LSN 尚未确认")
+    if cp["status"] == "aborted":
+        raise HTTPException(
+            409, f"核对点 {name} 登记已中断/失败（aborted），请用同名重新登记")
+    return cp
+
+
+def _job_cp_or_409(job: dict) -> dict:
+    """任务与核对点的身份校验：任务创建时绑定的 id/LSN 必须与当前记录一致。
+
+    同名核对点被作废后重新登记会得到新的 id 与 LSN；旧任务绝不能拿新标记
+    冒充登记结果，也不能把旧标记用在新任务上。
+    """
+    cp = state.one_row(
+        "SELECT * FROM checkpoints WHERE name=?", (job["checkpoint_name"],)
+    )
+    err = state.checkpoint_identity_error(job, cp)
+    if err:
+        raise HTTPException(409, err)
     return cp
 
 
@@ -183,29 +227,41 @@ def make_backup(force: bool = Query(
 @app.post("/api/checkpoints", tags=["checkpoint"], status_code=201,
           summary="登记命名核对点（pg_create_restore_point）")
 def create_checkpoint(body: CheckpointIn):
-    if state.one_row("SELECT id FROM checkpoints WHERE name=?", (body.name,)):
-        raise HTTPException(409, f"核对点 {body.name} 已存在")
+    """并发同名请求最多一个成功；已确认名称继续拒绝重复登记。
+
+    流程：先原子占位（pending，不携带任何旧 LSN）→ 用**本次新生成的唯一内部名**
+    在源库写入恢复点 → 把本次调用返回的 LSN 绑定到该占位。源库已写标记但 API
+    未登记就退出时，占位留在 pending；重启后统一作废（aborted），同名可重新
+    登记。每次登记的内部名都不同，恢复端绝不会被历史同名标记误导。
+    """
+    source_name = f"pitr_{secrets.token_hex(8)}"[:63]
     try:
-        lsn, wal_file = source.create_restore_point(body.name)
+        cid = state.reserve_checkpoint(body.name, source_name)
+    except state.CheckpointExists as e:
+        raise HTTPException(409, str(e))
+    try:
+        lsn, wal_file = source.create_restore_point(source_name)
+        cp = state.confirm_checkpoint(cid, body.name, lsn, wal_file)
+    except state.CheckpointNotPending as e:
+        # 并发同名请求已占位成功 / 重启清理，本次源库标记不可绑定
+        state.abort_checkpoint(cid, str(e))
+        raise HTTPException(409, str(e))
     except Exception as e:  # noqa: BLE001
+        state.abort_checkpoint(cid, f"在源库创建命名恢复点失败: {e}")
         raise HTTPException(502, f"在源库创建命名恢复点失败: {e}")
-    cid = state.execute(
-        "INSERT INTO checkpoints (name, restore_lsn, wal_file, status, created_at)"
-        " VALUES (?,?,?,?,?)",
-        (body.name, lsn, wal_file, "waiting_wal", state.now()),
-    )
     refresh_checkpoints()  # 立即检查一次，通常几秒内即 ready
-    return state.one_row("SELECT * FROM checkpoints WHERE id=?", (cid,))
+    return _public_cp(state.one_row("SELECT * FROM checkpoints WHERE id=?", (cid,)))
 
 
 @app.get("/api/checkpoints", tags=["checkpoint"], summary="核对点列表")
 def list_checkpoints():
-    return state.all_rows("SELECT * FROM checkpoints ORDER BY id")
+    return [_public_cp(c) for c in
+            state.all_rows("SELECT * FROM checkpoints ORDER BY id")]
 
 
 @app.get("/api/checkpoints/{name}", tags=["checkpoint"], summary="核对点详情")
 def get_checkpoint(name: str):
-    return _cp_or_404(name)
+    return _public_cp(_cp_or_404(name))
 
 
 # ------------------------------------------------------------------ 恢复任务
@@ -213,14 +269,15 @@ def get_checkpoint(name: str):
 @app.post("/api/recoveries", tags=["recovery"], status_code=202,
           summary="按核对点发起恢复（一次只恢复一项）")
 def start_recovery(body: RecoveryIn):
-    cp = _cp_or_404(body.checkpoint)
+    cp = _confirmed_cp_or_409(body.checkpoint)
     if cp["status"] == "expired":
         raise HTTPException(409, "核对点已过期（存在更新的基准备份），无法恢复")
     _ensure_no_active_job()
     jid = state.execute(
-        "INSERT INTO jobs (checkpoint_name, status, created_at, updated_at)"
-        " VALUES (?,?,?,?)",
-        (body.checkpoint, "queued", state.now(), state.now()),
+        "INSERT INTO jobs (checkpoint_name, checkpoint_id, checkpoint_lsn,"
+        " status, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+        (body.checkpoint, cp["id"], cp["restore_lsn"],
+         "queued", state.now(), state.now()),
     )
     return state.one_row("SELECT * FROM jobs WHERE id=?", (jid,))
 
@@ -241,14 +298,22 @@ def retry_recovery(job_id: int):
     job = _job_or_404(job_id)
     if job["status"] not in state.RETRYABLE_JOB_STATES:
         raise HTTPException(409, f"任务状态 {job['status']} 不可重试")
-    cp = _cp_or_404(job["checkpoint_name"])
+    # 重试只认任务创建时绑定的核对点身份；迁移期未补全的旧任务直接拒绝，
+    # 绝不按名称去猜，避免用到后来同名重新登记的标记。
+    if job.get("checkpoint_id") is None or not job.get("checkpoint_lsn"):
+        raise HTTPException(
+            409, f"任务 #{job_id} 缺少核对点身份快照，无法安全重试；"
+                 "请对当前核对点重新发起恢复")
+    cp = _job_cp_or_409(job)
     if cp["status"] == "expired":
         raise HTTPException(409, "核对点已过期（存在更新的基准备份），无法恢复")
     _ensure_no_active_job()
+    # 重试仍绑定原任务登记时的 id/LSN，绝不改用后来同名登记的标记
     jid = state.execute(
-        "INSERT INTO jobs (checkpoint_name, status, created_at, updated_at)"
-        " VALUES (?,?,?,?)",
-        (job["checkpoint_name"], "queued", state.now(), state.now()),
+        "INSERT INTO jobs (checkpoint_name, checkpoint_id, checkpoint_lsn,"
+        " status, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+        (job["checkpoint_name"], job["checkpoint_id"], job["checkpoint_lsn"],
+         "queued", state.now(), state.now()),
     )
     return state.one_row("SELECT * FROM jobs WHERE id=?", (jid,))
 
@@ -284,7 +349,10 @@ def _query_meta(job: dict) -> dict:
     return {
         "job_id": job["id"],
         "checkpoint": job["checkpoint_name"],
-        "restore_lsn": cp["restore_lsn"] if cp else None,
+        # 报告任务绑定并校验过的 LSN，而不是名字当前可能已变化的记录
+        "restore_lsn": job.get("checkpoint_lsn")
+                       or (cp["restore_lsn"] if cp else None),
+        "checkpoint_id": job.get("checkpoint_id"),
         "queried_instance": f"recovered-instance:{config.RECOVERY_PORT}"
                             f"（独立只读库，非生产源库）",
         "read_only": True,
